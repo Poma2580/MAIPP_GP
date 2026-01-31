@@ -1,0 +1,25 @@
+# MAIPP_GP project dependencies
+# Generated from import analysis on 2025-12-09
+
+# bash:
+# conda activate xhk
+# cd /home/ychx/xhk/MAIPP_GP
+# pip install -r requirements.txt
+
+# Core scientific stack
+numpy>=1.21
+scipy>=1.7
+pandas>=1.4
+matplotlib>=3.5
+
+# Deep learning & GP
+torch>=2.0.0
+gpytorch>=1.9
+
+# Reinforcement learning environment
+gymnasium>=0.28.0
+gymnasium[box2d]       # Optional: for classic control envs (e.g., if you test with CartPole later)
+
+# Utilities
+numpyencoder>=0.3.0
+tqdm>=4.60              # Highly recommended for progress bars (you'll likely use it)

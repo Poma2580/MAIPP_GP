@@ -192,12 +192,17 @@ class GPExactRegressor:
         self.likelihood.eval()
 
     # ----------------------------- 预测接口 -----------------------------
-    def predict(self, X_test: Optional[np.ndarray] = None) -> Tuple[np.ndarray, np.ndarray]:
+    def predict(self, X_test: Optional[np.ndarray] = None, agent_id: Optional[int] = None) -> Tuple[np.ndarray, np.ndarray]:
         """对给定测试点做 GP 预测"""
         if X_test is None:
             test_x = self.test_x
         else:
             test_x = torch.tensor(np.asarray(X_test, dtype=np.float32), dtype=self.dtype).to(self.device)
+
+        if agent_id is not None:
+            self.select_agent_dataset(agent_id)
+        else:
+            self.set_dataset_global()
 
         with torch.no_grad(), gpytorch.settings.fast_pred_var():
             posterior = self.model(test_x)
@@ -226,7 +231,7 @@ class GPExactRegressor:
         return np.array(high_info_points, dtype=np.float32) # shape (M,2)
 
     # 获取周围最近的K个高价值区域点的均值和高斯方差（若提供了 high_info_area）
-    def get_nearby_high_info(self, query_points: np.ndarray, high_info_area: Optional[np.ndarray] = None, K: int = 8) -> Tuple[np.ndarray, np.ndarray]:
+    def get_nearby_high_info(self, query_points: np.ndarray, high_info_area: Optional[np.ndarray] = None, K: int = 8, agent_id: Optional[int] = None) -> Tuple[np.ndarray, np.ndarray]:
         """对于给定的查询点，获取其附近K个高信息区域点的均值和方差"""
         if high_info_area is None or high_info_area.shape[0] == 0:
             return np.array([], dtype=np.float32), np.array([], dtype=np.float32)
@@ -238,7 +243,7 @@ class GPExactRegressor:
             nearest_indices = np.argsort(dists)[:K]
             nearest_points = high_info_area[nearest_indices]
 
-            mean_np, var_np = self.predict(nearest_points)
+            mean_np, var_np = self.predict(nearest_points, agent_id=agent_id)
             mean_list.append(mean_np)
             var_list.append(var_np)
 

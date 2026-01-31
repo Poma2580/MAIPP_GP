@@ -2,6 +2,7 @@ import os
 import re
 import torch
 import numpy as np
+from typing import Dict, List, Optional, Set, Union
 from args import get_args
 from field_env import MultiRobotFieldEnv
 from mappo_network import MAPPO_MPE
@@ -16,20 +17,43 @@ It will:
   4. Print per-episode reward statistics.
 """
 
-def find_latest_checkpoint(log_dir: str):
-    pattern = re.compile(r"MAPPO_actor_step_(\d+)k\.pth")
-    latest_step = -1
-    latest_path = None
+def find_latest_checkpoint(log_dir: str, per_agent_actor: bool, n_agents: int):
+    """Return latest checkpoint path(s).
+
+    - per_agent_actor=False: returns a single path str
+    - per_agent_actor=True:  returns a list[str] with length n_agents (all agents for the same step)
+    """
     if not os.path.isdir(log_dir):
         return None
+
+    if not per_agent_actor:
+        pattern = re.compile(r"MAPPO_actor_step_(\d+)k\.pth")
+        latest_step = -1
+        latest_path = None
+        for fname in os.listdir(log_dir):
+            m = pattern.match(fname)
+            if m:
+                step_k = int(m.group(1))
+                if step_k > latest_step:
+                    latest_step = step_k
+                    latest_path = os.path.join(log_dir, fname)
+        return latest_path
+
+    # per-agent: choose the largest step_k where all agent_i files exist
+    pattern = re.compile(r"MAPPO_actor_agent_(\d+)_step_(\d+)k\.pth")
+    have: Dict[int, Set[int]] = {}
     for fname in os.listdir(log_dir):
         m = pattern.match(fname)
-        if m:
-            step_k = int(m.group(1))
-            if step_k > latest_step:
-                latest_step = step_k
-                latest_path = os.path.join(log_dir, fname)
-    return latest_path
+        if not m:
+            continue
+        agent_id = int(m.group(1))
+        step_k = int(m.group(2))
+        have.setdefault(step_k, set()).add(agent_id)
+
+    for step_k in sorted(have.keys(), reverse=True):
+        if all(i in have[step_k] for i in range(n_agents)):
+                return [os.path.join(log_dir, f"MAPPO_actor_agent_{i}_step_{step_k}k.pth") for i in range(n_agents)]
+    return None
 
 def load_model(actor, path, device):
     if path is None or not os.path.isfile(path):
@@ -43,6 +67,63 @@ def load_model(actor, path, device):
     print(f"[Load] 成功载入模型: {os.path.basename(path)}")
 
 
+def resolve_checkpoint(
+    log_dir: str,
+    per_agent_actor: bool,
+    n_agents: int,
+    model_path: Optional[str],
+    step_k: Optional[int],
+) -> Union[str, List[str], None]:
+    """Resolve checkpoint path(s) to load.
+
+    Returns either:
+    - str (single actor checkpoint)
+    - list[str] (per-agent actor checkpoints)
+    - None
+    """
+    # If model_path provided
+    if model_path:
+        # allow passing a directory when per_agent_actor=True
+        if os.path.isdir(model_path):
+            base_dir = model_path
+            return find_latest_checkpoint(base_dir, per_agent_actor=per_agent_actor, n_agents=n_agents)
+
+        # model_path is a file
+        if not per_agent_actor:
+            return model_path
+
+        m = re.match(r".*MAPPO_actor_agent_(\d+)_step_(\d+)k\.pth$", os.path.basename(model_path))
+        if m:
+            step = int(m.group(2))
+            base_dir = os.path.dirname(model_path)
+            paths = [os.path.join(base_dir, f"MAPPO_actor_agent_{i}_step_{step}k.pth") for i in range(n_agents)]
+            if all(os.path.isfile(p) for p in paths):
+                return paths
+        raise ValueError("per_agent_actor=True 时，--model_path 请传目录，或传形如 MAPPO_actor_agent_0_step_XXk.pth 的文件")
+
+    # No model_path: use log_dir + step_k/latest
+    if step_k is not None:
+        if per_agent_actor:
+            paths = [os.path.join(log_dir, f"MAPPO_actor_agent_{i}_step_{int(step_k)}k.pth") for i in range(n_agents)]
+            if all(os.path.isfile(p) for p in paths):
+                return paths
+        else:
+            candidate = os.path.join(log_dir, f"MAPPO_actor_step_{int(step_k)}k.pth")
+            if os.path.isfile(candidate):
+                return candidate
+
+    resolved = find_latest_checkpoint(log_dir, per_agent_actor=per_agent_actor, n_agents=n_agents)
+    if resolved is not None:
+        return resolved
+
+    # fallback: legacy single-file checkpoint (old behavior)
+    legacy = find_latest_checkpoint(log_dir, per_agent_actor=False, n_agents=n_agents)
+    if legacy is not None:
+        print("[Warn] 未找到 per-agent checkpoint，回退到单文件 MAPPO_actor_step_*.pth")
+        return legacy
+    return None
+
+
 def evaluate(env, agent: MAPPO_MPE, episodes: int, render: bool = True):
     rewards = []
     traces = []
@@ -50,8 +131,7 @@ def evaluate(env, agent: MAPPO_MPE, episodes: int, render: bool = True):
     for epi in range(episodes):
         obs_n = env.reset()
         if agent.use_rnn:
-            agent.actor.rnn_hidden = None  # type: ignore[assignment]
-            agent.critic.rnn_hidden = None  # type: ignore[assignment]
+            agent.reset_rnn_hidden()
         ep_reward = 0.0
         ep_trace = 0.0
         for step in range(agent.episode_limit):
@@ -117,23 +197,21 @@ def main():
 
     # log directory
     log_dir = f'./data_train_MPE/{args.env_name}/MAPPO/number_{number}_seed_{seed}'
-    ckpt_path = getattr(args, 'model_path', None)
-    # step_k 指定时构造文件名
-    if ckpt_path is None:
-        step_k = getattr(args, 'step_k', None)
-        if step_k is not None:
-            candidate = os.path.join(log_dir, f"MAPPO_actor_step_{int(step_k)}k.pth")
-            if os.path.isfile(candidate):
-                ckpt_path = candidate
-            else:
-                print(f"[Warn] 指定 step_k={step_k} 的文件不存在: {candidate}")
-        # 若未找到或未指定 step_k，回退最新
-        if ckpt_path is None:
-            ckpt_path = find_latest_checkpoint(log_dir)
-    if ckpt_path is None:
+    ckpt = resolve_checkpoint(
+        log_dir=log_dir,
+        per_agent_actor=bool(getattr(args, 'per_agent_actor', False)),
+        n_agents=args.N,
+        model_path=getattr(args, 'model_path', None),
+        step_k=getattr(args, 'step_k', None),
+    )
+    if ckpt is None:
         raise FileNotFoundError(f"未找到任何 checkpoint，请确认训练已生成模型文件，目录: {log_dir}")
 
-    load_model(agent.actor, ckpt_path, device)
+    if isinstance(ckpt, list):
+        for i, p in enumerate(ckpt):
+            load_model(agent.actor[i], p, device)  # type: ignore[index]
+    else:
+        load_model(agent.actor, ckpt, device)
 
     # 载入权重后再次确保 eval()
     agent.actor.eval()

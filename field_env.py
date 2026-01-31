@@ -168,7 +168,7 @@ class MultiRobotFieldEnv:
             if pos not in positions:
                 positions.append(pos)
         # 改为固定初始位置，便于调试
-        # positions = [(7, 8), (2, self.grid_size[1]-7), (self.grid_size[0]-6, 11)]
+        positions = [(7, 8), (2, self.grid_size[1]-7), (self.grid_size[0]-6, 11)]
         self.positions = positions
         self.step_count = 0
         self.time_left = self.max_steps
@@ -233,6 +233,7 @@ class MultiRobotFieldEnv:
                     query_points=np.array([[x_pos, y_pos]], dtype=np.float32),
                     high_info_area=high_info_area,
                     K=self.high_info_K,
+                    agent_id=None, 
                 )
                 # get_nearby_high_info 对单个 query 会返回 shape (K,)
                 nearby_means = np.asarray(nearby_means, dtype=np.float32).reshape(-1)
@@ -266,6 +267,7 @@ class MultiRobotFieldEnv:
                         query_points=np.array([[n_x_pos, n_y_pos]], dtype=np.float32),
                         high_info_area=high_info_area,
                         K=self.high_info_K,
+                        agent_id=None,  
                     )
                     n_means = np.asarray(n_means, dtype=np.float32).reshape(-1)
                     n_vars = np.asarray(n_vars, dtype=np.float32).reshape(-1)

@@ -127,8 +127,7 @@ class Runner_MAPPO_IPP:
         if self.args.use_reward_scaling:
             self.reward_scaling.reset()
         if self.args.use_rnn:
-            self.agent_n.actor.rnn_hidden = None  # type: ignore
-            self.agent_n.critic.rnn_hidden = None  # type: ignore
+            self.agent_n.reset_rnn_hidden()
         for step in range(self.args.episode_limit):
             a_n, a_logprob_n = self.agent_n.choose_action(obs_n, evaluate=evaluate)
             s = np.array(obs_n).flatten()

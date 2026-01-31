@@ -7,12 +7,12 @@ import os
 
 
 # Trick 8: orthogonal initialization
-def orthogonal_init(layer, gain=1.0):
+def orthogonal_init(layer, gain: float = 1.0):
     for name, param in layer.named_parameters():
         if 'bias' in name:
             nn.init.constant_(param, 0)
         elif 'weight' in name:
-            nn.init.orthogonal_(param, gain=gain)
+            nn.init.orthogonal_(param, gain=float(gain))  # type: ignore[arg-type]
 
 
 class Actor_RNN(nn.Module):
@@ -144,6 +144,8 @@ class MAPPO_MPE:
         self.use_rnn = args.use_rnn
         self.add_agent_id = args.add_agent_id
         self.use_value_clip = args.use_value_clip
+        # Whether each agent has its own actor network (instead of sharing one actor across agents)
+        self.per_agent_actor = bool(getattr(args, "per_agent_actor", False))
 
         # get the input dimension of actor and critic
         self.actor_input_dim = args.obs_dim
@@ -155,10 +157,16 @@ class MAPPO_MPE:
 
         if self.use_rnn:
             print("------use rnn------")
-            self.actor = Actor_RNN(args, self.actor_input_dim)
+            if self.per_agent_actor:
+                self.actor = nn.ModuleList([Actor_RNN(args, self.actor_input_dim) for _ in range(self.N)])
+            else:
+                self.actor = Actor_RNN(args, self.actor_input_dim)
             self.critic = Critic_RNN(args, self.critic_input_dim)
         else:
-            self.actor = Actor_MLP(args, self.actor_input_dim)
+            if self.per_agent_actor:
+                self.actor = nn.ModuleList([Actor_MLP(args, self.actor_input_dim) for _ in range(self.N)])
+            else:
+                self.actor = Actor_MLP(args, self.actor_input_dim)
             self.critic = Critic_MLP(args, self.critic_input_dim)
         # move networks to device
         self.actor.to(self.device)
@@ -173,6 +181,17 @@ class MAPPO_MPE:
         else:
             self.ac_optimizer = _optim.Adam(self.ac_parameters, lr=self.lr)  # type: ignore[attr-defined]
 
+    def reset_rnn_hidden(self):
+        """Reset RNN hidden states (supports both shared-actor and per-agent-actor)."""
+        if not self.use_rnn:
+            return
+        if self.per_agent_actor:
+            for a in self.actor:  # type: ignore[union-attr]
+                a.rnn_hidden = None  # type: ignore[assignment]
+        else:
+            self.actor.rnn_hidden = None  # type: ignore[assignment]
+        self.critic.rnn_hidden = None  # type: ignore[assignment]
+
     def choose_action(self, obs_n, evaluate):
         with torch.no_grad():
             actor_inputs = []
@@ -182,20 +201,33 @@ class MAPPO_MPE:
                 obs_n = _np.asarray(obs_n, dtype=_np.float32)
                 obs_n = torch.from_numpy(obs_n)
             obs_n = obs_n.to(device=self.device, dtype=torch.float32)  # obs_n.shape=(N, obs_dim)
-            actor_inputs.append(obs_n)
-            if self.add_agent_id:
-                """
-                    Add an one-hot vector to represent the agent_id
-                    For example, if N=3
-                    [obs of agent_1]+[1,0,0]
-                    [obs of agent_2]+[0,1,0]
-                    [obs of agent_3]+[0,0,1]
-                    So, we need to concatenate a N*N unit matrix(torch.eye(N))
-                """
-                actor_inputs.append(torch.eye(self.N, device=self.device))
+            if self.per_agent_actor:
+                # Per-agent actor: compute prob for each agent independently
+                probs = []
+                for i in range(self.N):
+                    if self.add_agent_id:
+                        eye = torch.eye(self.N, device=self.device)
+                        inp = torch.cat([obs_n[i], eye[i]], dim=-1)
+                    else:
+                        inp = obs_n[i]
+                    prob_i = self.actor[i](inp.unsqueeze(0)).squeeze(0)  # type: ignore[index]
+                    probs.append(prob_i)
+                prob = torch.stack(probs, dim=0)  # (N, action_dim)
+            else:
+                actor_inputs.append(obs_n)
+                if self.add_agent_id:
+                    """
+                        Add an one-hot vector to represent the agent_id
+                        For example, if N=3
+                        [obs of agent_1]+[1,0,0]
+                        [obs of agent_2]+[0,1,0]
+                        [obs of agent_3]+[0,0,1]
+                        So, we need to concatenate a N*N unit matrix(torch.eye(N))
+                    """
+                    actor_inputs.append(torch.eye(self.N, device=self.device))
 
-            actor_inputs = torch.cat([x for x in actor_inputs], dim=-1)  # actor_input.shape=(N, actor_input_dim)
-            prob = self.actor(actor_inputs)  # prob.shape=(N,action_dim)
+                actor_inputs = torch.cat([x for x in actor_inputs], dim=-1)  # actor_input.shape=(N, actor_input_dim)
+                prob = self.actor(actor_inputs)  # prob.shape=(N,action_dim)
             if evaluate:  # When evaluating the policy, we select the action with the highest probability
                 a_n = prob.argmax(dim=-1)
                 return a_n.detach().cpu().numpy(), None
@@ -253,19 +285,35 @@ class MAPPO_MPE:
                 """
                 if self.use_rnn:
                     # If use RNN, we need to reset the rnn_hidden of the actor and critic.
-                    self.actor.rnn_hidden = None  # type: ignore[assignment]
-                    self.critic.rnn_hidden = None  # type: ignore[assignment]
+                    self.reset_rnn_hidden()
                     probs_now, values_now = [], []
                     for t in range(self.episode_limit):
-                        prob = self.actor(actor_inputs[index, t].reshape(self.mini_batch_size * self.N, -1)) # prob.shape=(mini_batch_size*N, action_dim)
-                        probs_now.append(prob.reshape(self.mini_batch_size, self.N, -1))  # prob.shape=(mini_batch_size,N,action_dim）
+                        if self.per_agent_actor:
+                            probs_t = []
+                            for i in range(self.N):
+                                inp_i = actor_inputs[index, t, i]  # (mini_batch_size, actor_input_dim)
+                                prob_i = self.actor[i](inp_i)  # type: ignore[index]
+                                probs_t.append(prob_i)
+                            probs_t = torch.stack(probs_t, dim=1)  # (mini_batch_size, N, action_dim)
+                            probs_now.append(probs_t)
+                        else:
+                            prob = self.actor(actor_inputs[index, t].reshape(self.mini_batch_size * self.N, -1)) # prob.shape=(mini_batch_size*N, action_dim)
+                            probs_now.append(prob.reshape(self.mini_batch_size, self.N, -1))  # prob.shape=(mini_batch_size,N,action_dim）
                         v = self.critic(critic_inputs[index, t].reshape(self.mini_batch_size * self.N, -1))  # v.shape=(mini_batch_size*N,1)
                         values_now.append(v.reshape(self.mini_batch_size, self.N))  # v.shape=(mini_batch_size,N)
                     # Stack them according to the time (dim=1)
                     probs_now = torch.stack(probs_now, dim=1)
                     values_now = torch.stack(values_now, dim=1)
                 else:
-                    probs_now = self.actor(actor_inputs[index])
+                    if self.per_agent_actor:
+                        probs_agents = []
+                        for i in range(self.N):
+                            prob_i = self.actor[i](actor_inputs[index, :, i])  # type: ignore[index]
+                            # prob_i: (mini_batch_size, episode_limit, action_dim)
+                            probs_agents.append(prob_i)
+                        probs_now = torch.stack(probs_agents, dim=2)  # (mini_batch_size, episode_limit, N, action_dim)
+                    else:
+                        probs_now = self.actor(actor_inputs[index])
                     values_now = self.critic(critic_inputs[index]).squeeze(-1)
 
                 dist_now = Categorical(probs_now)
@@ -317,26 +365,45 @@ class MAPPO_MPE:
 
     def save_model(self,total_steps, save_dir):
         """
-        Save actor weights. If save_dir is provided, save there (recommended: pass Runner's self.log_dir).
-        Otherwise, fall back to default path under data_train_MPE/{env}/MAPPO/number_{number}_seed_{seed}.
+        Save actor weights.
+        - If per_agent_actor=False: save a single file: MAPPO_actor_step_{k}k.pth
+        - If per_agent_actor=True:  save N files:      MAPPO_actor_agent_{i}_step_{k}k.pth
         """
-        save_path = os.path.join(
-            save_dir,
-            "MAPPO_actor_step_{}k.pth".format(
-                int(total_steps / 1000)
-            ),
-        )
-        torch.save(self.actor.state_dict(), save_path)
+        step_k = int(total_steps / 1000)
+        if self.per_agent_actor:
+            for i in range(self.N):
+                save_path = os.path.join(save_dir, f"MAPPO_actor_agent_{i}_step_{step_k}k.pth")
+                torch.save(self.actor[i].state_dict(), save_path)  # type: ignore[index]
+        else:
+            save_path = os.path.join(save_dir, f"MAPPO_actor_step_{step_k}k.pth")
+            torch.save(self.actor.state_dict(), save_path)
 
     def load_model(self,total_steps, load_dir):
         """
-        Load actor weights. If load_dir is provided, load from there; otherwise use default path.
+        Load actor weights from directory.
+        - If per_agent_actor=False: expects MAPPO_actor_step_{k}k.pth
+        - If per_agent_actor=True:  expects MAPPO_actor_agent_{i}_step_{k}k.pth (for all i)
         """
-        load_path = os.path.join(
-            load_dir,
-            "MAPPO_actor_step_{}k.pth".format(int(total_steps / 1000)),
-        )
-        self.actor.load_state_dict(torch.load(load_path))
+        step_k = int(total_steps / 1000)
+        if self.per_agent_actor:
+            for i in range(self.N):
+                load_path = os.path.join(load_dir, f"MAPPO_actor_agent_{i}_step_{step_k}k.pth")
+                if not os.path.isfile(load_path):
+                    raise FileNotFoundError(f"[Error] actor checkpoint not found: {load_path}")
+                try:
+                    state_dict = torch.load(load_path, map_location=self.device, weights_only=True)
+                except TypeError:
+                    state_dict = torch.load(load_path, map_location=self.device)
+                self.actor[i].load_state_dict(state_dict)  # type: ignore[index]
+        else:
+            load_path = os.path.join(load_dir, f"MAPPO_actor_step_{step_k}k.pth")
+            if not os.path.isfile(load_path):
+                raise FileNotFoundError(f"[Error] actor checkpoint not found: {load_path}")
+            try:
+                state_dict = torch.load(load_path, map_location=self.device, weights_only=True)
+            except TypeError:
+                state_dict = torch.load(load_path, map_location=self.device)
+            self.actor.load_state_dict(state_dict)
 
 
 class MapEncoderCNN(nn.Module):

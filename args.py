@@ -47,13 +47,13 @@ def get_args():
     
     # === 测试/日志参数 ===
     parser.add_argument('--number_test', type=int, default=7, help='Run number for logging folder')
-    parser.add_argument('--seed_test', type=int, default=0, help='Random seed for testing')
+    parser.add_argument('--seed_test', type=int, default=1, help='Random seed for testing')
     parser.add_argument('--render', type=int, default=1, help='Render during testing (1 true, 0 false)')
     parser.add_argument('--test_episodes', type=int, default=1, help='Number of test episodes to run')
     parser.add_argument('--model_path', type=str, default=None, help='Explicit path to a model .pth to load during testing')
     parser.add_argument('--step_k', type=int, default=None, help='If specified, load MAPPO_actor_step_{step_k}k.pth from log_dir')
     # === MAPPO 训练与算法超参数 ===
-    parser.add_argument("--max_train_steps", type=int, default=int(3e6), help="Maximum number of training steps")
+    parser.add_argument("--max_train_steps", type=int, default=int(2000), help="Maximum number of training steps")
     parser.add_argument("--episode_limit", type=int, default=20, help="Maximum number of steps per episode")
     parser.add_argument("--evaluate_freq", type=int, default=500, help="Evaluate the policy every N env steps")
     parser.add_argument("--evaluate_times", type=int, default=3, help="How many episodes per evaluation")
@@ -79,12 +79,13 @@ def get_args():
     parser.add_argument("--set_adam_eps", type=float, default=True, help="Set Adam epsilon=1e-5")
     parser.add_argument("--use_relu", type=bool, default=False, help="Use ReLU instead of Tanh")
     parser.add_argument("--use_rnn", type=bool, default=False, help="Use RNN policy/value")
-    parser.add_argument("--add_agent_id", type=bool, default=True, help="Append agent id to observation")
+    parser.add_argument("--add_agent_id", type=bool, default=False, help="Append agent id to observation")
+    parser.add_argument("--per_agent_actor", type=bool, default=True, help="Use independent actor per agent (otherwise share one actor)")
     parser.add_argument("--use_value_clip", type=bool, default=False, help="Use value clip like PPO2")
     # 统一 env_name 与 number（供日志使用）
     parser.add_argument("--env_name", type=str, default='field_env', help='Environment name for logging')
-    parser.add_argument("--number", type=int, default=6, help='Run number for  logging')
-    parser.add_argument('--seed', type=int, default=0, help='Random seed')
+    parser.add_argument("--number", type=int, default=7, help='Run number for  logging')
+    parser.add_argument('--seed', type=int, default=2, help='Random seed')
     # 测试与训练: 若外部需要自定义模型加载, 允许命令行参数生效
     args = parser.parse_args()
 

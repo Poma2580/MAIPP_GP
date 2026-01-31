@@ -1,44 +1,8 @@
-# =====================
-# Python
-# =====================
 __pycache__/
 *.pyc
-*.pyo
-*.pyd
-*.egg-info/
-.eggs/
 .venv/
 venv/
 .env
-
-# =====================
-# Experiment outputs / RL
-# =====================
-logs/
-results/
-checkpoints/
-models/
-runs/
-wandb/
-
-# Text / data outputs (keep README, ignore raw outputs)
-*_log.txt
-*_output.txt
-*.csv
-
-# =====================
-# Jupyter
-# =====================
-.ipynb_checkpoints/
-
-# =====================
-# IDE / Editor
-# =====================
 .vscode/
 .idea/
-
-# =====================
-# OS
-# =====================
-.DS_Store
 Thumbs.db

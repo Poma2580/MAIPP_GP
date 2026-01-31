@@ -4,7 +4,7 @@ def get_args():
     parser = argparse.ArgumentParser(description="Multi-Robot Source Seeking Simulation Parameters")
     # 获取场数据相对路径
     current_dir = os.path.dirname(os.path.abspath(__file__))
-    default_field_path = os.path.join(current_dir, '..', 'sim_field_data', 'static', 'sources_4','seed_1', 'field_final.npz')
+    default_field_path = os.path.join(current_dir, '..', 'sim_field_data', 'static', 'sources_5','seed_1', 'field_final.npz')
     default_config_path = os.path.join(os.path.dirname(default_field_path), 'config.json')
 
     # 场参数
@@ -30,13 +30,13 @@ def get_args():
                         help='Number of grid points per dimension used for Gaussian Process estimation')
 
     # === 奖励相关系数 ===
-    parser.add_argument('--repeat_penalty_coef', type=float, default=15.0,
+    parser.add_argument('--repeat_penalty_coef', type=float, default=3.0,
                         help='Penalty coefficient for revisiting the same cell')
-    parser.add_argument('--coordination_coef', type=float, default=15.0,
+    parser.add_argument('--coordination_coef', type=float, default=0.0,
                         help='Reward coefficient encouraging coordination among agents')
-    parser.add_argument('--boundary_coef', type=float, default=15.0,
+    parser.add_argument('--boundary_coef', type=float, default=3.0,
                         help='Penalty coefficient for approaching boundary or leaving the valid area, ATTENTION: hit boundary will cause the agent to move back')
-    parser.add_argument('--conc_reward_coef', type=float, default=1.0,
+    parser.add_argument('--conc_reward_coef', type=float, default=0.0,
                         help='Reward coefficient for exploring high concentration regions')
     parser.add_argument('--gp_reward_coef', type=float, default=25.0,
                         help='Reward coefficient for reducing GP predictive uncertainty')
@@ -46,10 +46,10 @@ def get_args():
                         help='Step size (movement distance per action)')
     
     # === 测试/日志参数 ===
-    parser.add_argument('--number_test', type=int, default=4, help='Run number for logging folder')
-    parser.add_argument('--seed_test', type=int, default=1, help='Random seed for testing')
+    parser.add_argument('--number_test', type=int, default=7, help='Run number for logging folder')
+    parser.add_argument('--seed_test', type=int, default=0, help='Random seed for testing')
     parser.add_argument('--render', type=int, default=1, help='Render during testing (1 true, 0 false)')
-    parser.add_argument('--test_episodes', type=int, default=3, help='Number of test episodes to run')
+    parser.add_argument('--test_episodes', type=int, default=1, help='Number of test episodes to run')
     parser.add_argument('--model_path', type=str, default=None, help='Explicit path to a model .pth to load during testing')
     parser.add_argument('--step_k', type=int, default=None, help='If specified, load MAPPO_actor_step_{step_k}k.pth from log_dir')
     # === MAPPO 训练与算法超参数 ===
@@ -83,7 +83,7 @@ def get_args():
     parser.add_argument("--use_value_clip", type=bool, default=False, help="Use value clip like PPO2")
     # 统一 env_name 与 number（供日志使用）
     parser.add_argument("--env_name", type=str, default='field_env', help='Environment name for logging')
-    parser.add_argument("--number", type=int, default=5, help='Run number for  logging')
+    parser.add_argument("--number", type=int, default=6, help='Run number for  logging')
     parser.add_argument('--seed', type=int, default=0, help='Random seed')
     # 测试与训练: 若外部需要自定义模型加载, 允许命令行参数生效
     args = parser.parse_args()

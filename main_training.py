@@ -13,6 +13,7 @@ from mappo_network import MAPPO_MPE
 from field_env import MultiRobotFieldEnv
 from args import get_args
 from numpyencoder import NumpyEncoder   # pip install numpyencoder
+### nohup python3 /home/ychx/xhk/MAIPP_GP_V2.0/main_training.py > training_output.log 2>&1 &
 
 
 class Runner_MAPPO_IPP:

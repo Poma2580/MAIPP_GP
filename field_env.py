@@ -7,17 +7,26 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import json
+import torch
 from GP_utils import GPExactRegressor
+
 class MultiRobotFieldEnv:
     def __init__(self, args, reward_fn=None, done_fn=None):
         self.args = args
         self.num_agents = args.num_agents
+        # 每个位置周围选取的高价值区域点个数（用于构造固定长度观测）
+        self.high_info_K = int(getattr(args, 'high_info_K', 8))
         # 对齐外部训练器的接口
         self.n = self.num_agents
         self.grid_size = args.grid_size  # (Ny, Nx)
         self.Lx, self.Ly = args.Lx, args.Ly
         self.dx = self.Lx / (self.grid_size[1] - 1)  # Nx = grid_size[1]
         self.dy = self.Ly / (self.grid_size[0] - 1)  # Ny = grid_size[0]
+        x_coords = np.linspace(0, self.Lx, self.grid_size[1])
+        y_coords = np.linspace(0, self.Ly, self.grid_size[0])
+        # 按坐标点排列: [x1, y1], [x1, y2], [x1, y3], ...
+        self.map_coords = [np.array([x, y], dtype=np.float32) for x in x_coords for y in y_coords]
+        self.map_values, self.map_vars = None, None  # GP 预测的均值/方差网格（用于可视化/调试等）
         self.max_steps = args.max_steps
         self.use_relative_pos = args.use_relative_pos
         self.np_random = np.random.RandomState(args.seed)
@@ -48,7 +57,7 @@ class MultiRobotFieldEnv:
                 # convenience attributes
                 self.gp_hyperparams = config.get('gp_hyperparams', {})
                 # 直接从 gp_hyperparams 中获取参数，
-                self.gp_lengthscale = float(self.gp_hyperparams.get('lengthscale', np.nan)) 
+                self.gp_lengthscale = float(self.gp_hyperparams.get('lengthscale', np.nan)) * self.gp_lengthscale_factor
                 self.gp_outputscale = float(self.gp_hyperparams.get('outputscale', np.nan))  
                 self.gp_noise = float(self.gp_hyperparams.get('noise', np.nan)) 
                 self.gp_mode = self.gp_hyperparams.get('mode', None)  # 'exact' or 'svgp' if saved
@@ -79,8 +88,15 @@ class MultiRobotFieldEnv:
             except Exception:
                 self.conc_max = 1.0
 
+        # 归一化场值
+        self.field = (self.field - self.conc_min) / (self.conc_max - self.conc_min)
+        
+        # 归一化高斯超参
+        self.gp_outputscale /= (self.conc_max - self.conc_min) ** 2
+        self.gp_noise /= (self.conc_max - self.conc_min) ** 2
+
         # 设定初始高斯协方差之和
-        self.prior_var = self.sigma_f * self.gp_grid_N * self.gp_grid_N
+        self.prior_var =  self.gp_grid_N * self.gp_grid_N * self.sigma_f 
 
         # 动作：8方向（dy, dx）
         self.step_size = getattr(args, 'step_size', 4)  # Todo: could be parameterized
@@ -98,9 +114,11 @@ class MultiRobotFieldEnv:
         ]
 
         # 计算 observation_space 维度并创建 gym space（float）
-        # base obs per agent: pos_x,pos_y (2) + z_curr (1) + z_hist(2) + last_action(dx,dy) (2) + local_var (self.local_var_len) + time_left(1)
-        base_dim = 2 + 1 + 2 + 2 + self.local_var_len + 1
-        # other agents messages: for each other agent: [agent_id, rel_x, rel_y, z_peak, local_var_sum] -> 5 dims per neighbor
+        # base obs per agent:
+        # [pos_x, pos_y, self_nearby_means(K), self_nearby_vars(K)]
+        base_dim = 2 + 2 * self.high_info_K
+        # other agents messages per neighbor:
+        # [agent_id, rel_x, rel_y, neighbor_nearby_mean_avg, neighbor_nearby_var_avg]
         neighbor_dim = (self.num_agents - 1) * 5
         total_dim = base_dim + neighbor_dim
         # 对齐主训练循环接口：为每个 agent 提供同构的观测空间
@@ -110,7 +128,7 @@ class MultiRobotFieldEnv:
 
         # 回调函数
         self.reward_fn = reward_fn if reward_fn else self._default_reward
-        self.done_fn = done_fn if done_fn else self._default_done
+ 
 
         # 图像
         self.trajectories = [[] for _ in range(self.num_agents)]
@@ -149,6 +167,8 @@ class MultiRobotFieldEnv:
             )
             if pos not in positions:
                 positions.append(pos)
+        # 改为固定初始位置，便于调试
+        # positions = [(7, 8), (2, self.grid_size[1]-7), (self.grid_size[0]-6, 11)]
         self.positions = positions
         self.step_count = 0
         self.time_left = self.max_steps
@@ -172,62 +192,61 @@ class MultiRobotFieldEnv:
             # 同步记录初始测量值（与 trajectories 对齐）
             self.meas_values[i].append(conc)
 
-        # 根据初始位置计算初始全局高斯协方差
+        # 根据初始位置计算初始化高斯函数
         payload = self.train_pos()
         self.gp_regressor = GPExactRegressor(payload, gp_params=self.gp_hyperparams, grid_N=self.gp_grid_N)
-        # mean_grid, var_grid, grid = self.gp_regressor.predict_on_eval_grid()
-        # # 全局协方差(for reward calculation)
-        # self.posterior_var = var_grid
-        # 局部协方差初始化
-        self.local_prior_var =  []
-        for i in range(self.num_agents):
-            agent_pos = self.positions[i]  # 获取当前 agent 的位置
-            local_X, local_var = self.gp_regressor.get_local_covariance_circular(i, agent_pos)
-            self.local_prior_var.append(local_var)
+        # 获取高价值区域
+        self.high_info_area = self.gp_regressor.get_high_info_area(threshold=0.5, beta=0.5)
 
-        obs = self._get_obs(local_X, local_var)
+        # 计算各种指标
+        self.cov_trace = self.gp_regressor.compute_cov_trace(self.high_info_area)
+        self.rmse = self.gp_regressor.compute_rmse(self.field)
+        self.MI = self.gp_regressor.compute_mutual_info(self.high_info_area)
+        # 计算初始全局高斯均值与方差 shape: np.array (Nx, Ny)
+        self.map_values, self.map_vars, _ = self.gp_regressor.predict_on_eval_grid()
+
+        obs = self._get_obs(self.high_info_area)
         # 与主训练循环对齐：仅返回 obs 列表
         return obs
 
-    def _get_obs(self, local_X, local_var):
+    def _get_obs(self, high_info_area=None):
         """
         返回每个agent的观测列表list, 每个观测为np.array(float32)
-        包含内容：
-        [pos_x, pos_y, z_curr, z_hist[-2], z_hist[-1], last_action_dx, last_action_dy, local_var (len L), time_left,
-         then for each other agent j != i: [agent_id, rel_x, rel_y, z_peak, local_var_sum] ]
-        并且做归一化处理
+        布局：
+        [pos_x, pos_y, 周围高价值区域点的均值(K)和方差(K),
+         then for each other agent j != i: [agent_id, rel_x, rel_y, 每个邻居周围高价值点的均值/方差各自取平均] ]
+        并且做归一化处理（位置/相对位置缩放到 [0,1] 左右，agent_id 归一到 [0,1]）
         """
         obs_list = []
-        # 为每个 agent 计算局部协方差并更新 local_vars_state
-        for i in range(self.num_agents):
-            agent_pos = self.positions[i]  # 获取当前 agent 的位置
-            self.local_vars_state[i] = self.gp_regressor.get_local_covariance(i, agent_pos, local_X, local_var)
-
         # 构建观测
         for i in range(self.num_agents):
             y, x = self.positions[i]
             # 自身真实位置（以长度单位）
             x_pos = x * self.dx
             y_pos = y * self.dy
-            # 自身浓度
-            conc = self.field[y, x] + self.np_random.normal(0, 0.01)  # 加噪声
+            # 观测基础部分：自身位置
+            base = [float(x_pos), float(y_pos)]
 
-            # 保证 z_history 有两个值
-            z_hist_vals = self.z_history[i]
-            if len(z_hist_vals) < 2:
-                z_hist_vals = [z_hist_vals[-1]] * 2
+            # 观测部分：自身周围高价值区域点的均值和方差（固定长度 K）
+            if high_info_area is not None and len(high_info_area) > 0:
+                nearby_means, nearby_vars = self.gp_regressor.get_nearby_high_info(
+                    query_points=np.array([[x_pos, y_pos]], dtype=np.float32),
+                    high_info_area=high_info_area,
+                    K=self.high_info_K,
+                )
+                # get_nearby_high_info 对单个 query 会返回 shape (K,)
+                nearby_means = np.asarray(nearby_means, dtype=np.float32).reshape(-1)
+                nearby_vars = np.asarray(nearby_vars, dtype=np.float32).reshape(-1)
+                if nearby_means.shape[0] < self.high_info_K:
+                    nearby_means = np.pad(nearby_means, (0, self.high_info_K - nearby_means.shape[0]))
+                if nearby_vars.shape[0] < self.high_info_K:
+                    nearby_vars = np.pad(nearby_vars, (0, self.high_info_K - nearby_vars.shape[0]))
+            else:
+                nearby_means = np.zeros((self.high_info_K,), dtype=np.float32)
+                nearby_vars = np.zeros((self.high_info_K,), dtype=np.float32)
 
-            last_dx, last_dy = self.last_actions[i]
-            base = [x_pos, y_pos, conc, float(z_hist_vals[-2]), float(z_hist_vals[-1]),
-                    float(last_dx), float(last_dy)]
-            
-            # 加入 local_vars_state
-            if self.local_var_len > 0:
-                base.extend(list(map(float, self.local_vars_state[i].tolist())))
-            # time left normalized to [0,1] (avoid division by zero)
-            base.append(float(self.time_left))
-
-            # obs_i = [x_pos, y_pos, conc]
+            base.extend(nearby_means.tolist())
+            base.extend(nearby_vars.tolist())
 
             # 邻居信息构建 for i: fixed order j=0..num_agents-1, skip i
             for j in range(self.num_agents):
@@ -238,11 +257,25 @@ class MultiRobotFieldEnv:
                 yj, xj = self.positions[j]
                 rel_x = float((xj - x) * self.dx)
                 rel_y = float((yj - y) * self.dy)
-                # z_peak: using neighbor's most recent measurement (max of z_history) as proxy
-                z_peak = float(max(self.z_history[j]) if len(self.z_history[j])>0 else self.field[yj, xj])
-                # local_var_sum placeholder (sum of local_var vector) - currently zero if not set
-                local_var_sum = float(np.sum(self.local_vars_state[j])) if self.local_var_len > 0 else 0.0
-                base.extend([agent_id, rel_x, rel_y, z_peak, local_var_sum])
+
+                # 邻居周围高价值区域点的 mean/var 各自取平均（固定 2 维）
+                if high_info_area is not None and len(high_info_area) > 0:
+                    n_x_pos = float(xj * self.dx)
+                    n_y_pos = float(yj * self.dy)
+                    n_means, n_vars = self.gp_regressor.get_nearby_high_info(
+                        query_points=np.array([[n_x_pos, n_y_pos]], dtype=np.float32),
+                        high_info_area=high_info_area,
+                        K=self.high_info_K,
+                    )
+                    n_means = np.asarray(n_means, dtype=np.float32).reshape(-1)
+                    n_vars = np.asarray(n_vars, dtype=np.float32).reshape(-1)
+                    neighbor_mean_avg = float(np.mean(n_means)) if n_means.size > 0 else 0.0
+                    neighbor_var_avg = float(np.mean(n_vars)) if n_vars.size > 0 else 0.0
+                else:
+                    neighbor_mean_avg = 0.0
+                    neighbor_var_avg = 0.0
+
+                base.extend([agent_id, rel_x, rel_y, neighbor_mean_avg, neighbor_var_avg])
 
             obs_array = np.array(base, dtype=np.float32)
             # 归一化 obs 向量
@@ -318,23 +351,22 @@ class MultiRobotFieldEnv:
             self.meas_values[i].append(z_val)
 
 
-        # 计算新的全局高斯协方差
+        # 更新高斯过程的训练数据
         payload = self.train_pos()
         self.gp_regressor.update_dataset_from_payload(payload)
-        # 
-        # mean_grid, var_grid, grid = self.gp_regressor.predict_on_eval_grid()
-        # self.posterior_var = var_grid
-        # 更新局部协方差
-        self.local_posterior_var = []
-        for i in range(self.num_agents):
-            agent_pos = self.positions[i]  # 获取当前 agent 的位置
-            local_X, local_var = self.gp_regressor.get_local_covariance_circular(i, agent_pos)
-            self.local_posterior_var.append(local_var)
-
-
+        # 更新地图高斯均值与方差
+        self.map_values, self.map_vars, _ = self.gp_regressor.predict_on_eval_grid()
+        # 更新高价值区域
+        self.high_info_area = self.gp_regressor.get_high_info_area(threshold=0.5, beta=0.5)
+        # 打印高价值区域个数
+        # print(f"High info area size: {len(self.high_info_area)}")
+        # 计算各种指标
+        self.cov_trace_new = self.gp_regressor.compute_cov_trace(self.high_info_area)
+        self.rmse = self.gp_regressor.compute_rmse(self.field)
+        self.MI = self.gp_regressor.compute_mutual_info(self.high_info_area)
         
-        # 获取观测
-        obs = self._get_obs(local_X, local_var)
+        # 更新观测（把当前 high_info_area 作为输入，保持观测维度一致）
+        obs = self._get_obs(self.high_info_area)
 
         # 计算奖励（每个智能体）与奖励组成部分
         rewards = []
@@ -369,10 +401,9 @@ class MultiRobotFieldEnv:
         terminated_list = [terminated] * self.num_agents
         truncated_list = [False] * self.num_agents
 
-        # # 更新全局 prior_var
-        # self.prior_var = self.posterior_var
-        # 更新局部 prior_var
-        self.local_prior_var = self.local_posterior_var
+        # 更新协方差迹
+        self.cov_trace = self.cov_trace_new
+
 
         # 与主训练循环对齐：返回(obs, rewards, done_list, info)
         done_list = [bool(t or tr) for t, tr in zip(terminated_list, truncated_list)]
@@ -395,8 +426,7 @@ class MultiRobotFieldEnv:
 
 
         # 基础奖励：场值(min_max 归一化)
-        conc_reward = float((self.field[y_i, x_i]- self.conc_min) /
-                             (self.conc_max - self.conc_min))
+        conc_reward = float(self.field[y_i, x_i])
 
         # 边界惩罚 penalty scale [0, 1]
         bound_penalty = -1.0 if hit_boundary else 0.0
@@ -441,8 +471,8 @@ class MultiRobotFieldEnv:
 
         # 高斯过程不确定性奖励（for agent_id）
 
-        delta_I =  (np.sum(self.local_prior_var[agent_id]) - np.sum(self.local_posterior_var[agent_id])) / np.sum(self.local_prior_var[agent_id] + 1e-6)
-        gp_reward = float(delta_I) 
+        delta_I =  (self.cov_trace - self.cov_trace_new) / self.cov_trace  # 归一化的信息增益
+        gp_reward = float(delta_I) if delta_I > 0 else 0.0
 
         # 总奖励
         total_reward = conc_reward * self.conc_reward_coef +  \
@@ -452,9 +482,6 @@ class MultiRobotFieldEnv:
                     gp_reward * self.gp_reward_coef
         return total_reward, conc_reward, gp_reward, bound_penalty, repeat_pen, coor_pen
 
-    # 默认终止：永不终止（由 max_steps 控制）
-    def _default_done(self):
-        return False
 
     # utility: expose train positions (unique)
     def train_pos(self):
@@ -648,6 +675,70 @@ class MultiRobotFieldEnv:
         else:
             plt.pause(0.5)  # 非阻塞，给 GUI 刷新一点时间
 
+# 绘制high info area
+    def render_high_info_area(self, mode='human', block=False, save_path: str = None):
+        """
+        可视化当前 GP 高价值区域（high info area）。
+        使用与环境相同的坐标范围 [0, Lx] × [0, Ly]。
+        """
+        if mode != 'human':
+            return
+
+        # 如果当前 figure 不存在或已被关闭，则重新创建
+        if (self.fig is None) or (not plt.fignum_exists(self.fig.number)):
+            self.fig, self.ax = plt.subplots(figsize=(8, 6))
+            self.cbar_hia = None
+        else:
+            self.ax.clear()
+
+        # 绘制场
+        im = self.ax.imshow(
+            self.field,
+            origin='lower',
+            extent=[0, self.Lx, 0, self.Ly],
+            cmap='plasma',
+            alpha=0.8
+        )
+
+        # # colorbar：只创建一次
+        # if self.cbar_hia is None:
+        #     self.cbar_hia = self.fig.colorbar(im, ax=self.ax, label='Concentration')
+        # else:
+        #     self.cbar_hia.update_normal(im)
+
+        # 绘制 high info area 点
+        if len(self.high_info_area) > 0:
+            hia_array = np.array(self.high_info_area)
+            self.ax.scatter(
+                hia_array[:, 0],
+                hia_array[:, 1],
+                c='cyan',
+                s=30,
+                edgecolors='k',
+                label='High Info Area'
+            )
+
+        # 轴与标题
+        self.ax.set_title(f'High Info Area (size: {len(self.high_info_area)})')
+        self.ax.set_xlabel('X')
+        self.ax.set_ylabel('Y')
+        self.ax.set_xlim(0, self.Lx)
+        self.ax.set_ylim(0, self.Ly)
+        self.ax.grid(True, alpha=0.3)
+        self.fig.tight_layout()
+
+        # 保存静态图片
+        if save_path is not None:
+            self.fig.savefig(save_path, dpi=300)
+            print(f"Saved high info area visualization to {save_path}")
+
+        # 显示 / 刷新
+        self.fig.canvas.draw()
+        if block:
+            plt.show(block=True)
+        else:
+            plt.pause(0.5)
+
 # 绘制预测结果
     def render_gp_prediction(self, mode='human', block=False, save_path: str = None):
         """
@@ -753,44 +844,24 @@ class MultiRobotFieldEnv:
         """
         内部方法：把单个 obs 向量按字段归一化并返回新的 numpy array (float32).
         Assumes layout per agent (same as _get_obs builds):
-        [pos_x, pos_y, z_curr, z_hist[-2], z_hist[-1], last_dx, last_dy,
-           local_var (self.local_var_len), time_left,
-           then for each other agent j != i: [agent_id, rel_x, rel_y, z_peak, local_var_sum] ]
+          [pos_x, pos_y, self_nearby_means(K), self_nearby_vars(K),
+              then for each other agent j != i:
+                [agent_id, rel_x, rel_y, neighbor_nearby_mean_avg, neighbor_nearby_var_avg] ]
         """
         o = obs_vec.astype(np.float32).copy()
         Lx = float(self.Lx)
         Ly = float(self.Ly)
-        max_dim = max(Lx, Ly)
-
-        # determine z_scale: use self.conc_max if available, else 1.0
-        z_scale = None
-        z_scale = self.conc_max if self.conc_max is not None else 1.0 
         idx = 0
+
         # pos_x, pos_y
         o[idx] = o[idx] / Lx; idx += 1
         o[idx] = o[idx] / Ly; idx += 1
-        # z_curr
-        o[idx] = o[idx] / (z_scale if z_scale != 0 else 1.0); idx += 1
-        # z_hist (2 entries)
-        o[idx] = o[idx] / (z_scale if z_scale != 0 else 1.0); idx += 1
-        o[idx] = o[idx] / (z_scale if z_scale != 0 else 1.0); idx += 1
-        # last_action dx, dy (in meters) -> normalize by max_dim
-        o[idx] = o[idx] / max_dim; idx += 1
-        o[idx] = o[idx] / max_dim; idx += 1
 
-        # local_var (vector)
-        if self.local_var_len > 0:
-            for k in range(self.local_var_len):
-                # normalize by gp_outputscale if available, else by sigma_f
-                denom = self.sigma_f
-                o[idx] = o[idx] / denom
-                idx += 1
+        # self_nearby_means(K), self_nearby_vars(K): 目前保持原尺度（通常已经在 [0,1] 左右）
+        idx += 2 * int(getattr(self, 'high_info_K', 8))
 
-        # time_left -> normalize by max_steps to [0,1]
-        o[idx] = o[idx] / float(self.max_steps) if self.max_steps > 0 else 0.0
-        idx += 1
-
-        # neighbor messages: each chunk = 5 (agent_id, rel_x, rel_y, z_peak, local_var_sum)
+        # neighbor messages: each chunk = 5
+        # (agent_id, rel_x, rel_y, neighbor_mean_avg, neighbor_var_avg)
         chunk = 5
         # compute number of neighbors expected (num_agents-1)
         n_neighbors = self.num_agents - 1
@@ -809,9 +880,8 @@ class MultiRobotFieldEnv:
             o[idx] = o[idx] / Lx; idx += 1
             # rel_y
             o[idx] = o[idx] / Ly; idx += 1
-            # z_peak
-            o[idx] = o[idx] / (z_scale if z_scale != 0 else 1.0); idx += 1
-            # local_var_sum
-            o[idx] = o[idx] / (z_scale if z_scale != 0 else 1.0); idx += 1
+
+            # neighbor_mean_avg, neighbor_var_avg: 保持原尺度
+            idx += 2
 
         return o.astype(np.float32)

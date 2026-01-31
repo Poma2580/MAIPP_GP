@@ -214,71 +214,75 @@ class GPExactRegressor:
         var_grid = var_np.reshape(N, N)
         return mean_grid, var_grid, {'Xg': self.eval_grid['Xg'], 'Yg': self.eval_grid['Yg']}
 
-    # ----------------------------- 返回局部协方差 -----------------------------
-    def get_local_covariance(self, agent_id: int, agent_pos: np.ndarray, local_X: np.ndarray, local_var: np.ndarray, num_neighbors: int = 8) -> np.ndarray:
-        """获取指定 agent 的局部协方差（以周围最近的 num_neighbors 个点为依据）（方形）"""
-        
-        # 1. 获取当前 agent 的位置
-        x_agent, y_agent = agent_pos
+    # -----------------------------  确定高信息区域-----------------------------
+    def get_high_info_area(self, threshold: float = 0.4, beta: float = 1.0) -> np.ndarray:
+        """获取高信息区域的坐标点，基于预测均值和不确定性"""
+        mean_np, var_np = self.predict()
+        std_np = np.sqrt(var_np)
+        high_info_points = []
+        for i in range(mean_np.shape[0]):
+            if mean_np[i] + beta * std_np[i] >= threshold:
+                high_info_points.append(self.eval_grid['test_xy_np'][i])
+        return np.array(high_info_points, dtype=np.float32) # shape (M,2)
 
-        # # 2. 获取评估网格的所有点（网格大小）
-        # Xg = self.eval_grid['Xg']
-        # Yg = self.eval_grid['Yg']
-        
-        # 3. 计算评估网格每个点与 agent 位置的距离
-        grid_points = local_X  # 使用传入的局部点坐标
-        agent_pos_2d = np.array([x_agent, y_agent])
-        
-        dist = distance.cdist([agent_pos_2d], grid_points)[0]  # 距离向量
-        
-        # 4. 找到距离最近的 num_neighbors 个网格点
-        nearest_idx = np.argsort(dist)[:num_neighbors]
-        
-        # 5. 获取对应点的协方差值
-        local_covariance = local_var.ravel()[nearest_idx]  # 使用 ravel 将 grid flatten 为一维数组
-        
-        return local_covariance
+    # 获取周围最近的K个高价值区域点的均值和高斯方差（若提供了 high_info_area）
+    def get_nearby_high_info(self, query_points: np.ndarray, high_info_area: Optional[np.ndarray] = None, K: int = 8) -> Tuple[np.ndarray, np.ndarray]:
+        """对于给定的查询点，获取其附近K个高信息区域点的均值和方差"""
+        if high_info_area is None or high_info_area.shape[0] == 0:
+            return np.array([], dtype=np.float32), np.array([], dtype=np.float32)
+
+        mean_list = []
+        var_list = []
+        for qp in query_points:
+            dists = distance.cdist(high_info_area, qp.reshape(1, -1), metric='euclidean').reshape(-1)
+            nearest_indices = np.argsort(dists)[:K]
+            nearest_points = high_info_area[nearest_indices]
+
+            mean_np, var_np = self.predict(nearest_points)
+            mean_list.append(mean_np)
+            var_list.append(var_np)
+
+        return np.concatenate(mean_list, axis=0), np.concatenate(var_list, axis=0)
     
-    ## 用圆形邻域获取局部协方差
-    def get_local_covariance_circular(
-        self,
-        agent_id: int,
-        agent_pos: np.ndarray,
-        radius: float = 4.0,
-    ):
-        """获取指定 agent 的局部协方差（以半径 radius 内的点为依据）（圆形）
-        只对圆形邻域内的网格点做 GP 预测，返回这些点的坐标和方差。
-        """
-        # 1. 获取当前 agent 的位置
-        x_agent, y_agent = agent_pos
 
-        # 2. 获取评估网格的所有点（网格大小）
-        Xg = self.eval_grid['Xg']  # (N, N)
-        Yg = self.eval_grid['Yg']  # (N, N)
 
-        # 3. 将网格点展开为 (N*N, 2)
-        grid_points = np.vstack([Xg.ravel(), Yg.ravel()]).T.astype(np.float32)
-        agent_pos_2d = np.array([x_agent, y_agent], dtype=np.float32)
-
-        # 4. 计算每个网格点与 agent 位置的距离
-        dist = distance.cdist([agent_pos_2d], grid_points)[0]
-
-        # 5. 找到距离在 radius 范围内的网格点索引
-        within_radius_idx = np.where(dist <= radius)[0]
-
-        if within_radius_idx.size == 0:
-            # 半径内没有点时返回空
-            return np.empty((0, 2), dtype=np.float32), np.empty((0,), dtype=np.float32)
-
-        # 6. 取出圆形邻域内的局部网格点坐标
-        X_test_local = grid_points[within_radius_idx]  # (K, 2)
-
-        # 7. 只对这些局部点做 GP 预测，得到局部方差
-        _, local_var = self.predict(X_test=X_test_local)  # local_var: (K,)
-
-        return X_test_local, local_var
 # ----------------------------- 计算全局RMSE -----------------------------
-    def compute_rmse(self, true_field, mean_grid: np.ndarray) -> float:
-        """计算在评估网格上的 RMSE，true_field 形状应为 (N, N)"""
+    def compute_rmse(self, true_field: np.ndarray, mean_grid: Optional[np.ndarray] = None) -> float:
+        """计算在评估网格上的 RMSE。
+
+        参数:
+            true_field: 真实场值, 形状通常为 (N, N)。
+            mean_grid:  可选, 预测的均值场。如果为 None, 则使用当前 GP 在评估网格上的预测结果。
+        """
+        if mean_grid is None:
+            # 使用 GP 自身在评估网格上的预测
+            mean_np, _ = self.predict()
+            mean_grid = mean_np.reshape(self.grid_N, self.grid_N)
+        else:
+            mean_grid = np.asarray(mean_grid, dtype=np.float32)
+            # 尽量与 true_field 的形状对齐
+            if mean_grid.shape != true_field.shape:
+                mean_grid = mean_grid.reshape(true_field.shape)
+
         rmse = np.sqrt(np.mean((mean_grid - true_field) ** 2))
         return rmse
+# ----------------------------- 计算覆盖迹 -----------------------------
+    def compute_cov_trace(self, X_test: Optional[np.ndarray] = None) -> float:
+        """计算在评估网格(默认)上的覆盖迹"""
+        _, var = self.predict(X_test)
+        trace = np.sum(var*var)
+        return trace
+# ----------------------------- 计算互信息 -----------------------------
+    def compute_mutual_info(self, X_test: Optional[np.ndarray] = None) -> float:
+        """计算在评估网格(默认)上的互信息"""
+        if X_test is None:
+            test_x = self.test_x
+        else:
+            test_x = torch.tensor(np.asarray(X_test, dtype=np.float32), dtype=self.dtype).to(self.device)
+
+        n_sample = test_x.shape[0]
+        with torch.no_grad(), gpytorch.settings.fast_pred_var():
+            cov = self.model(test_x).covariance_matrix.detach().cpu().numpy()
+
+        mi = (1 / 2) * np.log(np.linalg.det(0.01 * cov + np.identity(n_sample)))
+        return mi

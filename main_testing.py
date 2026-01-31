@@ -34,7 +34,11 @@ def find_latest_checkpoint(log_dir: str):
 def load_model(actor, path, device):
     if path is None or not os.path.isfile(path):
         raise FileNotFoundError(f"[Error] 模型文件未找到: {path}")
-    state_dict = torch.load(path, map_location=device)
+    # torch>=2.1: 建议使用 weights_only=True 以降低反序列化风险
+    try:
+        state_dict = torch.load(path, map_location=device, weights_only=True)
+    except TypeError:
+        state_dict = torch.load(path, map_location=device)
     actor.load_state_dict(state_dict)
     print(f"[Load] 成功载入模型: {os.path.basename(path)}")
 
@@ -57,8 +61,9 @@ def evaluate(env, agent: MAPPO_MPE, episodes: int, render: bool = True):
             # if render:
             #     try:
             #         env.render(block=False)
-                # except Exception:
-                #     pass
+            #         env.render_high_info_area(block=False)
+            #     except Exception:
+            #         pass
             if all(done_n):
                 break
         # ep_trace = np.sum(env.posterior_var)
@@ -76,6 +81,7 @@ def evaluate(env, agent: MAPPO_MPE, episodes: int, render: bool = True):
         if render:
             env.render(block=True)
             env.render_gp_prediction(block=True)
+            env.render_high_info_area(block=True)
     rewards = np.array(rewards, dtype=np.float32)
     print("=========================================================")
     print(f"[Summary] episodes={episodes} mean={rewards.mean():.3f} std={rewards.std():.3f} min={rewards.min():.3f} max={rewards.max():.3f}")
@@ -107,6 +113,7 @@ def main():
     print(f"[Env] Prior GP variance sum: {env.prior_var:.3f}")
 
     agent = MAPPO_MPE(args)
+    agent.actor.eval()
 
     # log directory
     log_dir = f'./data_train_MPE/{args.env_name}/MAPPO/number_{number}_seed_{seed}'
@@ -127,6 +134,9 @@ def main():
         raise FileNotFoundError(f"未找到任何 checkpoint，请确认训练已生成模型文件，目录: {log_dir}")
 
     load_model(agent.actor, ckpt_path, device)
+
+    # 载入权重后再次确保 eval()
+    agent.actor.eval()
 
     evaluate(env, agent, episodes=test_episodes, render=bool(getattr(args, 'render', 1)))
 

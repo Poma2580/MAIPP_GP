@@ -22,14 +22,17 @@ if __name__ == "__main__":
         print("  Actions:", actions)
         print("  Observations:", obs)
         print("  Rewards:", rewards)
-        print("  Dones:", done_list)
-        env.render()  # ← 新增：渲染当前状态
+        # print("  Dones:", done_list)
+        env.render(block=False)  # ← 新增：渲染当前状态
+        env.render_high_info_area(block=False)  # ← 新增：渲染高信息区域
         if any(done_list):
             print("Done!")
+            env.render_gp_prediction(block=True)
             break
 
     # 阻塞保持图形窗口
     env.render(block=True)
+    env.render_gp_prediction(block=True)
 
     # 保存渲染图像
     # env.render(save_path="./demo_render.png")

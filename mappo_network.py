@@ -176,7 +176,12 @@ class MAPPO_MPE:
     def choose_action(self, obs_n, evaluate):
         with torch.no_grad():
             actor_inputs = []
-            obs_n = torch.tensor(obs_n, dtype=torch.float32, device=self.device)  # obs_n.shape=(N，obs_dim)
+            # obs_n 通常ে: list[np.ndarray] 会触发非常慢的构造路径；先转成单个 ndarray
+            if not isinstance(obs_n, torch.Tensor):
+                import numpy as _np
+                obs_n = _np.asarray(obs_n, dtype=_np.float32)
+                obs_n = torch.from_numpy(obs_n)
+            obs_n = obs_n.to(device=self.device, dtype=torch.float32)  # obs_n.shape=(N, obs_dim)
             actor_inputs.append(obs_n)
             if self.add_agent_id:
                 """
@@ -332,3 +337,45 @@ class MAPPO_MPE:
             "MAPPO_actor_step_{}k.pth".format(int(total_steps / 1000)),
         )
         self.actor.load_state_dict(torch.load(load_path))
+
+
+class MapEncoderCNN(nn.Module):
+    """卷积式地图编码器
+
+    输入: x.shape = (B, 2, H, W)，2 个通道分别是 mean_grid 和 var_grid
+    输出: embed.shape = (B, embed_dim)，每个 batch 一条地图 embedding 向量
+    """
+
+    def __init__(self, in_channels: int = 2, embed_dim: int = 128):
+        super(MapEncoderCNN, self).__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_channels, 16, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(16, 32, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),
+
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),
+        )
+        # 自适应池化到 1x1，保证与 H, W 无关
+        self.global_pool = nn.AdaptiveAvgPool2d(output_size=(1, 1))
+        self.fc = nn.Linear(64, embed_dim)
+        # 正则化
+        self.norm = nn.LayerNorm(embed_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, 2, H, W)
+        h = self.conv(x)                 # (B, 64, H', W')
+        h = self.global_pool(h)          # (B, 64, 1, 1)
+        h = h.view(h.size(0), -1)        # (B, 64)
+        embed = self.fc(h)               # (B, embed_dim)
+        embed = self.norm(embed)         # (B, embed_dim)
+        return embed
+
+
+def build_map_encoder_from_args(args) -> MapEncoderCNN:
+    """根据 args 构建地图编码器，方便在其他模块中直接使用。"""
+    embed_dim = getattr(args, "map_embed_dim", 128)
+    return MapEncoderCNN(in_channels=2, embed_dim=embed_dim)

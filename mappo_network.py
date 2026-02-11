@@ -115,7 +115,42 @@ class Critic_MLP(nn.Module):
         x = self.activate_func(self.fc2(x))
         value = self.fc3(x)
         return value
-
+    
+class QCritic_MLP(nn.Module):
+    """
+    Q Critic for COMA counterfactual baseline
+    Input: [global_state, joint_action_onehot_flat]
+    Output: Q(s, joint_a) - per-agent Q values
+    """
+    def __init__(self, args, state_dim, joint_action_dim):
+        super(QCritic_MLP, self).__init__()
+        input_dim = state_dim + joint_action_dim  # s + flattened joint action onehot
+        hidden_dim = getattr(args, 'coma_q_hidden_dim', 128)
+        self.N = args.N
+        
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc3 = nn.Linear(hidden_dim, self.N)  # Output per-agent Q values
+        self.activate_func = [nn.Tanh(), nn.ReLU()][args.use_relu]
+        
+        if args.use_orthogonal_init:
+            orthogonal_init(self.fc1)
+            orthogonal_init(self.fc2)
+            orthogonal_init(self.fc3)
+    
+    def forward(self, state, joint_action_onehot):
+        """
+        Args:
+            state: (B, state_dim) or (B, T, state_dim)
+            joint_action_onehot: (B, N*action_dim) or (B, T, N*action_dim)
+        Returns:
+            q_values: (B, N) or (B, T, N) per-agent Q values
+        """
+        x = torch.cat([state, joint_action_onehot], dim=-1)
+        x = self.activate_func(self.fc1(x))
+        x = self.activate_func(self.fc2(x))
+        q_values = self.fc3(x)
+        return q_values
 
 class MAPPO_MPE:
     def __init__(self, args):
@@ -146,6 +181,11 @@ class MAPPO_MPE:
         self.use_value_clip = args.use_value_clip
         # Whether each agent has its own actor network (instead of sharing one actor across agents)
         self.per_agent_actor = bool(getattr(args, "per_agent_actor", False))
+
+        # COMA 相关参数
+        self.use_coma_shaping = getattr(args, 'use_coma_shaping', False)
+        self.coma_beta = getattr(args, 'coma_beta', 0.1)
+        self.coma_clip = getattr(args, 'coma_clip', 5.0)
 
         # get the input dimension of actor and critic
         self.actor_input_dim = args.obs_dim
@@ -180,6 +220,20 @@ class MAPPO_MPE:
             self.ac_optimizer = _optim.Adam(self.ac_parameters, lr=self.lr, eps=1e-5)  # type: ignore[attr-defined]
         else:
             self.ac_optimizer = _optim.Adam(self.ac_parameters, lr=self.lr)  # type: ignore[attr-defined]
+
+        # Initialize Q Critic for COMA
+        if self.use_coma_shaping:
+            print("------use COMA reward shaping------")
+            joint_action_dim = self.N * self.action_dim  # N agents * action_dim (onehot)
+            self.q_critic = QCritic_MLP(args, self.state_dim, joint_action_dim)
+            self.q_critic.to(self.device)
+            
+            # Separate optimizer for Q critic
+            coma_q_lr = getattr(args, 'coma_q_lr', self.lr)
+            if self.set_adam_eps:
+                self.q_optimizer = _optim.Adam(self.q_critic.parameters(), lr=coma_q_lr, eps=1e-5)
+            else:
+                self.q_optimizer = _optim.Adam(self.q_critic.parameters(), lr=coma_q_lr)
 
     def reset_rnn_hidden(self):
         """Reset RNN hidden states (supports both shared-actor and per-agent-actor)."""
@@ -255,6 +309,11 @@ class MAPPO_MPE:
         for k in batch:
             batch[k] = batch[k].to(self.device)
 
+        # === COMA 奖励重塑 ===
+        coma_stats = None
+        if self.use_coma_shaping:
+            batch['r_n'], coma_stats = self.reshape_rewards_with_coma(batch)
+
         # Calculate the advantage using GAE
         adv = []
         gae = 0
@@ -274,6 +333,13 @@ class MAPPO_MPE:
             critic_inputs.shape=(batch_size, max_episode_len, N, critic_input_dim)
         """
         actor_inputs, critic_inputs = self.get_inputs(batch)
+
+        # Collect batch-level loss stats (one value per train() call)
+        actor_loss_sum = 0.0
+        critic_loss_sum = 0.0
+        update_count = 0
+        q_loss_sum = 0.0
+        q_update_count = 0
 
         # Optimize policy for K epochs:
         for _ in range(self.K_epochs):
@@ -334,6 +400,11 @@ class MAPPO_MPE:
                 else:
                     critic_loss = (values_now - v_target[index]) ** 2
 
+                # batch-level statistics (mean over all update steps in this train() call)
+                actor_loss_sum += float(actor_loss.mean().item())
+                critic_loss_sum += float(critic_loss.mean().item())
+                update_count += 1
+
                 self.ac_optimizer.zero_grad()
                 ac_loss = actor_loss.mean() + critic_loss.mean()
                 ac_loss.backward()
@@ -341,8 +412,24 @@ class MAPPO_MPE:
                     torch.nn.utils.clip_grad_norm_(self.ac_parameters, 10.0)
                 self.ac_optimizer.step()
 
+                # === 训练 Q Critic ===
+                if self.use_coma_shaping:
+                    q_loss_val = self.train_q_critic(batch, index)
+                    if q_loss_val is not None:
+                        q_loss_sum += float(q_loss_val)
+                        q_update_count += 1
+
         if self.use_lr_decay:
             self.lr_decay(total_steps)
+        
+        # Return stats for logging (COMA + losses)
+        train_stats = {} if coma_stats is None else dict(coma_stats)
+        if update_count > 0:
+            train_stats['actor_loss'] = actor_loss_sum / update_count
+            train_stats['critic_loss'] = critic_loss_sum / update_count
+        if q_update_count > 0:
+            train_stats['q_loss'] = q_loss_sum / q_update_count
+        return train_stats
 
     def lr_decay(self, total_steps):  # Trick 6: learning rate Decay
         lr_now = self.lr * (1 - total_steps / self.max_train_steps)
@@ -405,44 +492,135 @@ class MAPPO_MPE:
                 state_dict = torch.load(load_path, map_location=self.device)
             self.actor.load_state_dict(state_dict)
 
+    def compute_counterfactual_advantages(self, batch, step_indices=None):
+        """
+        计算每个 agent 的反事实优势 A_i^cf
+        
+        A_i^cf(s, a) = Q_i(s, a) - sum_{a_i'} pi_i(a_i'|o_i) * Q_i(s, (a_i', a_{-i}))
+        """
+        with torch.no_grad():
+            if step_indices is not None:
+                s = batch['s'][step_indices]  # (mini_batch, T, state_dim)
+                obs_n = batch['obs_n'][step_indices]  # (mini_batch, T, N, obs_dim)
+                actions_onehot = batch['actions_onehot_n'][step_indices]  # (mini_batch, T, N, A)
+            else:
+                s = batch['s']  # (batch_size, T, state_dim)
+                obs_n = batch['obs_n']
+                actions_onehot = batch['actions_onehot_n']
+            
+            B, T, N, A = actions_onehot.shape
+            
+            # 确保 s 的维度正确 (B, T, state_dim)
+            if s.dim() == 2:
+                # 如果 s 是 (B, state_dim)，扩展到 (B, T, state_dim)
+                s = s.unsqueeze(1).expand(B, self.episode_limit, -1)
+            
+            # 1. 计算当前 joint action 的 Q 值：Q_i(s, a)
+            joint_action_flat = actions_onehot.reshape(B, T, N * A)  # (B, T, N*A)
+            Q_current = self.q_critic(s, joint_action_flat)  # (B, T, N)
+            
+            # 2. 为每个 agent 计算反事实基线
+            advantages_cf = torch.zeros(B, T, N, device=self.device)
+            
+            for i in range(N):
+                # 获取 agent i 的策略分布 pi_i(a_i'|o_i)
+                obs_i = obs_n[:, :, i, :]  # (B, T, obs_dim)
+                
+                if self.add_agent_id:
+                    agent_id_onehot = torch.zeros(B, T, N, device=self.device)
+                    agent_id_onehot[:, :, i] = 1.0
+                    actor_input_i = torch.cat([obs_i, agent_id_onehot], dim=-1)
+                else:
+                    actor_input_i = obs_i
+                
+                # 获取策略概率分布
+                if self.per_agent_actor:
+                    actor_input_i_flat = actor_input_i.reshape(B * T, -1)
+                    probs_i = self.actor[i](actor_input_i_flat)  # (B*T, A)
+                    probs_i = probs_i.reshape(B, T, A)  # (B, T, A)
+                else:
+                    probs_i = self.actor(actor_input_i.reshape(B * T, -1))
+                    probs_i = probs_i.reshape(B, T, A)
+                
+                # 3. 计算反事实基线：sum_{a_i'} pi_i(a_i') * Q_i(s, (a_i', a_{-i}))
+                baseline = torch.zeros(B, T, device=self.device)
+                
+                # 批量化计算所有可能的 a_i'
+                for a_prime in range(A):
+                    # 构造反事实 joint action
+                    counterfactual_actions_onehot = actions_onehot.clone()
+                    counterfactual_actions_onehot[:, :, i, :] = 0.0
+                    counterfactual_actions_onehot[:, :, i, a_prime] = 1.0
+                    
+                    # Flatten joint action
+                    cf_joint_flat = counterfactual_actions_onehot.reshape(B, T, N * A)
+                    
+                    # 计算 Q_i(s, (a_i', a_{-i}))
+                    Q_cf = self.q_critic(s, cf_joint_flat)[:, :, i]  # (B, T)
+                    
+                    # 加权求和
+                    baseline += probs_i[:, :, a_prime] * Q_cf
+                
+                # 4. 计算优势：A_i^cf = Q_i(s, a) - baseline
+                advantages_cf[:, :, i] = Q_current[:, :, i] - baseline
+            
+            return advantages_cf
 
-class MapEncoderCNN(nn.Module):
-    """卷积式地图编码器
+    def reshape_rewards_with_coma(self, batch):
+        """
+        使用 COMA 反事实优势重塑奖励
+        
+        r_shaped_{i,t} = r_{i,t} + beta * clip(A_{i,t}^cf, -c, c)
+        """
+        if not self.use_coma_shaping:
+            return batch['r_n'], None
+        
+        # 计算反事实优势
+        advantages_cf = self.compute_counterfactual_advantages(batch)
+        
+        # 统计信息（用于日志记录）
+        adv_cf_mean = advantages_cf.mean().item()
+        adv_cf_std = advantages_cf.std().item()
+        coma_stats = {'adv_cf_mean': adv_cf_mean, 'adv_cf_std': adv_cf_std}
+        
+        # Clip 优势
+        advantages_clipped = torch.clamp(advantages_cf, -self.coma_clip, self.coma_clip)
+        
+        # 重塑奖励：原奖励 + beta * clipped_advantage
+        r_shaped_n = batch['r_n'] + self.coma_beta * advantages_clipped
+        
+        return r_shaped_n, coma_stats
 
-    输入: x.shape = (B, 2, H, W)，2 个通道分别是 mean_grid 和 var_grid
-    输出: embed.shape = (B, embed_dim)，每个 batch 一条地图 embedding 向量
-    """
+    def train_q_critic(self, batch, index):
+        """
+        训练 Q Critic 以拟合 TD target
+        
+        TD target: y_i = r_i + gamma * V_i(s')
+        Loss: MSE(Q_i(s, a), y_i)
+        """
+        s = batch['s'][index]  # (mini_batch, T, state_dim)
+        actions_onehot = batch['actions_onehot_n'][index]  # (mini_batch, T, N, A)
+        B, T, N, A = actions_onehot.shape
+        
+        # Flatten joint action
+        joint_action_flat = actions_onehot.reshape(B, T, N * A)
+        
+        # 计算 Q 值
+        q_values = self.q_critic(s, joint_action_flat)  # (B, T, N)
+        
+        # TD target：使用个体奖励 r_i + gamma * V_i(s')
+        q_target = batch['r_n'][index] + self.gamma * batch['v_n'][index, 1:] * (1 - batch['done_n'][index])
+        
+        # Q loss
+        q_loss = F.mse_loss(q_values, q_target.detach())
+        
+        # 更新 Q critic
+        self.q_optimizer.zero_grad()
+        q_loss.backward()
+        if self.use_grad_clip:
+            torch.nn.utils.clip_grad_norm_(self.q_critic.parameters(), 10.0)
+        self.q_optimizer.step()
 
-    def __init__(self, in_channels: int = 2, embed_dim: int = 128):
-        super(MapEncoderCNN, self).__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_channels, 16, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(16, 32, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2),
-
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2),
-        )
-        # 自适应池化到 1x1，保证与 H, W 无关
-        self.global_pool = nn.AdaptiveAvgPool2d(output_size=(1, 1))
-        self.fc = nn.Linear(64, embed_dim)
-        # 正则化
-        self.norm = nn.LayerNorm(embed_dim)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, 2, H, W)
-        h = self.conv(x)                 # (B, 64, H', W')
-        h = self.global_pool(h)          # (B, 64, 1, 1)
-        h = h.view(h.size(0), -1)        # (B, 64)
-        embed = self.fc(h)               # (B, embed_dim)
-        embed = self.norm(embed)         # (B, embed_dim)
-        return embed
+        return float(q_loss.detach().item())
 
 
-def build_map_encoder_from_args(args) -> MapEncoderCNN:
-    """根据 args 构建地图编码器，方便在其他模块中直接使用。"""
-    embed_dim = getattr(args, "map_embed_dim", 128)
-    return MapEncoderCNN(in_channels=2, embed_dim=embed_dim)

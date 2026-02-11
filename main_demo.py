@@ -24,7 +24,7 @@ if __name__ == "__main__":
         print("  Rewards:", rewards)
         # print("  Dones:", done_list)
         env.render(block=False)  # ← 新增：渲染当前状态
-        env.render_high_info_area(block=False)  # ← 新增：渲染高信息区域
+        env.render_high_info_area(block=True)  # ← 新增：渲染高信息区域
         if any(done_list):
             print("Done!")
             env.render_gp_prediction(block=True)

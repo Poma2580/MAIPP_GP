@@ -7,6 +7,7 @@ class ReplayBuffer:
         self.N = args.N
         self.obs_dim = args.obs_dim
         self.state_dim = args.state_dim
+        self.action_dim = args.action_dim
         self.episode_limit = args.episode_limit
         self.batch_size = args.batch_size
         self.episode_num = 0
@@ -21,7 +22,8 @@ class ReplayBuffer:
                        'a_n': np.empty([self.batch_size, self.episode_limit, self.N]),
                        'a_logprob_n': np.empty([self.batch_size, self.episode_limit, self.N]),
                        'r_n': np.empty([self.batch_size, self.episode_limit, self.N]),
-                       'done_n': np.empty([self.batch_size, self.episode_limit, self.N])
+                       'done_n': np.empty([self.batch_size, self.episode_limit, self.N]),
+                       'actions_onehot_n': np.zeros([self.batch_size, self.episode_limit, self.N, self.action_dim])
                        }
         self.episode_num = 0
 
@@ -33,6 +35,9 @@ class ReplayBuffer:
         self.buffer['a_logprob_n'][self.episode_num][episode_step] = a_logprob_n
         self.buffer['r_n'][self.episode_num][episode_step] = r_n
         self.buffer['done_n'][self.episode_num][episode_step] = done_n
+        # Store onehot encoded actions for COMA
+        for i in range(self.N):
+            self.buffer['actions_onehot_n'][self.episode_num][episode_step][i][a_n[i]] = 1.0
 
     def store_last_value(self, episode_step, v_n):
         self.buffer['v_n'][self.episode_num][episode_step] = v_n

@@ -6,3 +6,5 @@ venv/
 .vscode/
 .idea/
 Thumbs.db
+# Training data
+data_train_MPE/

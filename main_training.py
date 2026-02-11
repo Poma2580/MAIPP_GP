@@ -1,12 +1,10 @@
 import torch
 import numpy as np
-try:
-    from torch.utils.tensorboard import SummaryWriter  # type: ignore
-except Exception:
-    SummaryWriter = None
+from torch.utils.tensorboard import SummaryWriter  # type: ignore
 import os
 import csv
 import json
+from datetime import datetime
 from normalization import Normalization, RewardScaling
 from replay_buffer import ReplayBuffer
 from mappo_network import MAPPO_MPE
@@ -53,6 +51,8 @@ class Runner_MAPPO_IPP:
         # Logging
         self.log_dir = f'./data_train_MPE/{self.env_name}/MAPPO/number_{self.number}_seed_{self.seed}'
         os.makedirs(self.log_dir, exist_ok=True)
+        # Initialize TensorBoard writer
+        self.writer = SummaryWriter(log_dir=self.log_dir) if SummaryWriter is not None else None
         self.log_file = os.path.join(self.log_dir, 'metrics.csv')
         with open(self.log_file, 'w', newline='') as f:
             csv.writer(f).writerow(['total_steps', 'reward_mean', 'reward_std', 'reward_min', 'reward_max'])
@@ -83,7 +83,20 @@ class Runner_MAPPO_IPP:
             _, ep_steps, _, _, _ = self.run_episode(evaluate=False)
             self.total_steps += ep_steps
             if self.replay_buffer.episode_num == self.args.batch_size:
-                self.agent_n.train(self.replay_buffer, self.total_steps)
+                train_stats = self.agent_n.train(self.replay_buffer, self.total_steps)
+                if self.writer is not None and isinstance(train_stats, dict):
+                    # COMA statistics (if enabled)
+                    if 'adv_cf_mean' in train_stats:
+                        self.writer.add_scalar('COMA/adv_cf_mean', train_stats['adv_cf_mean'], self.total_steps)
+                    if 'adv_cf_std' in train_stats:
+                        self.writer.add_scalar('COMA/adv_cf_std', train_stats['adv_cf_std'], self.total_steps)
+                    # Batch-level losses
+                    if 'actor_loss' in train_stats:
+                        self.writer.add_scalar('Loss/actor_loss', train_stats['actor_loss'], self.total_steps)
+                    if 'critic_loss' in train_stats:
+                        self.writer.add_scalar('Loss/critic_loss', train_stats['critic_loss'], self.total_steps)
+                    if 'q_loss' in train_stats:
+                        self.writer.add_scalar('Loss/q_loss', train_stats['q_loss'], self.total_steps)
                 self.replay_buffer.reset_buffer()
         self.evaluate_policy()
 
@@ -101,6 +114,12 @@ class Runner_MAPPO_IPP:
             csv.writer(f).writerow([self.total_steps, *stats])
         self.evaluate_rewards.append(stats[0])
         print(f"[Eval] steps={self.total_steps} mean={stats[0]:.3f} std={stats[1]:.3f} min={stats[2]:.3f} max={stats[3]:.3f} posterior_trace_mean={traces_mean:.3f} rmse_mean={rmses_mean:.3f}")
+
+        # Log to TensorBoard
+        if self.writer is not None:
+            self.writer.add_scalar('Eval/reward_mean', stats[0], self.total_steps)
+            self.writer.add_scalar('Eval/posterior_trace_mean', traces_mean, self.total_steps)
+            self.writer.add_scalar('Eval/rmse_mean', rmses_mean, self.total_steps)
 
         # log each reward component
         conc_reward_mean = float(np.mean([comp['conc_reward'] for comp in reward_components]))

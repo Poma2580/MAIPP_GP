@@ -98,6 +98,10 @@ class MultiRobotFieldEnv:
         # 设定初始高斯协方差之和
         self.prior_var =  self.gp_grid_N * self.gp_grid_N * self.sigma_f 
 
+        # UCB 探索参数
+        self.ucb_beta = args.ucb_beta
+        self.ucb_threshold = args.ucb_threshold
+
         # 动作：8方向（dy, dx）
         self.step_size = getattr(args, 'step_size', 4)  # Todo: could be parameterized
         # 对齐主训练循环接口：每个 agent 一个离散动作空间
@@ -168,7 +172,7 @@ class MultiRobotFieldEnv:
             if pos not in positions:
                 positions.append(pos)
         # 改为固定初始位置，便于调试
-        positions = [(7, 8), (2, self.grid_size[1]-7), (self.grid_size[0]-6, 11)]
+        # positions = [(7, 8), (2, self.grid_size[1]-7), (self.grid_size[0]-6, 11)]
         self.positions = positions
         self.step_count = 0
         self.time_left = self.max_steps
@@ -196,7 +200,7 @@ class MultiRobotFieldEnv:
         payload = self.train_pos()
         self.gp_regressor = GPExactRegressor(payload, gp_params=self.gp_hyperparams, grid_N=self.gp_grid_N)
         # 获取高价值区域
-        self.high_info_area = self.gp_regressor.get_high_info_area(threshold=0.5, beta=0.5)
+        self.high_info_area = self.gp_regressor.get_high_info_area(threshold=self.ucb_threshold, beta=self.ucb_beta)
 
         # 计算各种指标
         self.cov_trace = self.gp_regressor.compute_cov_trace(self.high_info_area)
@@ -482,6 +486,10 @@ class MultiRobotFieldEnv:
                     bound_penalty * self.boundary_coef + \
                     repeat_pen * self.repeat_penalty_coef + \
                     gp_reward * self.gp_reward_coef
+        
+        # 引入coma算法，对奖励进行信用分配
+        # 先计算
+
         return total_reward, conc_reward, gp_reward, bound_penalty, repeat_pen, coor_pen
 
 
@@ -638,7 +646,9 @@ class MultiRobotFieldEnv:
                 # 没轨迹时也占位图例
                 line, = self.ax.plot([], [], color=color, linestyle='--', alpha=0.9, linewidth=2.5, label=label)
                 handles.append(line)
-
+            # 绘制起点位置(空心圆)
+            sx, sy = self.trajectories[i][0]
+            self.ax.plot(sx, sy, 'o', markerfacecolor='none', markeredgecolor=color, markersize=10, markeredgewidth=2)
             # 绘制当前位置（实心圆）
             px, py = self.trajectories[i][-1]
             self.ax.plot(px, py, 'o', color=color, markersize=10, markeredgecolor='k')

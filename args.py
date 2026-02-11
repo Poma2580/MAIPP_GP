@@ -28,6 +28,12 @@ def get_args():
                         help='Local variance window length for GP local covariance computation')
     parser.add_argument('--gp_grid_N', type=int, default=31,
                         help='Number of grid points per dimension used for Gaussian Process estimation')
+    
+    # === UCB 探索参数 ===
+    parser.add_argument('--ucb_beta', type=float, default=0.5,
+                        help='Exploration-exploitation trade-off parameter for UCB acquisition function')
+    parser.add_argument('--ucb_threshold', type=float, default=0.1,
+                        help='Threshold for UCB-based decision making')
 
     # === 奖励相关系数 ===
     parser.add_argument('--repeat_penalty_coef', type=float, default=3.0,
@@ -41,23 +47,35 @@ def get_args():
     parser.add_argument('--gp_reward_coef', type=float, default=25.0,
                         help='Reward coefficient for reducing GP predictive uncertainty')
 
+    # === COMA 反事实基线奖励重塑参数 ===
+    parser.add_argument('--use_coma_shaping', type=bool, default=False,
+                        help='Use COMA counterfactual baseline for reward shaping')
+    parser.add_argument('--coma_beta', type=float, default=0.1,
+                        help='Scaling factor for counterfactual advantage in reward shaping')
+    parser.add_argument('--coma_clip', type=float, default=1.0,
+                        help='Clip value for counterfactual advantage')
+    parser.add_argument('--coma_q_lr', type=float, default=5e-4,
+                        help='Learning rate for Q critic')
+    parser.add_argument('--coma_q_hidden_dim', type=int, default=64,
+                        help='Hidden dimension for Q critic network')
+
     # === 运动控制参数 ===
     parser.add_argument('--step_size', type=float, default=2.0,
                         help='Step size (movement distance per action)')
     
     # === 测试/日志参数 ===
-    parser.add_argument('--number_test', type=int, default=7, help='Run number for logging folder')
+    parser.add_argument('--number_test', type=int, default=8, help='Run number for logging folder')
     parser.add_argument('--seed_test', type=int, default=1, help='Random seed for testing')
     parser.add_argument('--render', type=int, default=1, help='Render during testing (1 true, 0 false)')
-    parser.add_argument('--test_episodes', type=int, default=1, help='Number of test episodes to run')
+    parser.add_argument('--test_episodes', type=int, default=3, help='Number of test episodes to run')
     parser.add_argument('--model_path', type=str, default=None, help='Explicit path to a model .pth to load during testing')
     parser.add_argument('--step_k', type=int, default=None, help='If specified, load MAPPO_actor_step_{step_k}k.pth from log_dir')
     # === MAPPO 训练与算法超参数 ===
-    parser.add_argument("--max_train_steps", type=int, default=int(2000), help="Maximum number of training steps")
+    parser.add_argument("--max_train_steps", type=int, default=int(3e5), help="Maximum number of training steps")
     parser.add_argument("--episode_limit", type=int, default=20, help="Maximum number of steps per episode")
-    parser.add_argument("--evaluate_freq", type=int, default=500, help="Evaluate the policy every N env steps")
+    parser.add_argument("--evaluate_freq", type=int, default=1000, help="Evaluate the policy every N env steps")
     parser.add_argument("--evaluate_times", type=int, default=3, help="How many episodes per evaluation")
-    parser.add_argument("--save_model_freq", type=int, default=5000, help="Save the model every N env steps")
+    parser.add_argument("--save_model_freq", type=int, default=50000, help="Save the model every N env steps")
 
     parser.add_argument("--batch_size", type=int, default=64, help="Batch size (episodes per update)")
     parser.add_argument("--mini_batch_size", type=int, default=16, help="Minibatch size (episodes)")
@@ -82,9 +100,9 @@ def get_args():
     parser.add_argument("--add_agent_id", type=bool, default=False, help="Append agent id to observation")
     parser.add_argument("--per_agent_actor", type=bool, default=True, help="Use independent actor per agent (otherwise share one actor)")
     parser.add_argument("--use_value_clip", type=bool, default=False, help="Use value clip like PPO2")
-    # 统一 env_name 与 number（供日志使用）
+    # 统一 env_name 与 number（供训练日志使用）
     parser.add_argument("--env_name", type=str, default='field_env', help='Environment name for logging')
-    parser.add_argument("--number", type=int, default=7, help='Run number for  logging')
+    parser.add_argument("--number", type=int, default=8, help='Run number for  logging')
     parser.add_argument('--seed', type=int, default=2, help='Random seed')
     # 测试与训练: 若外部需要自定义模型加载, 允许命令行参数生效
     args = parser.parse_args()
